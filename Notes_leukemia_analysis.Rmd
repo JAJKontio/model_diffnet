@@ -1,0 +1,146 @@
+---
+title: "Acute myeloid leukemia analysis: R-code"
+output: html_notebook
+--- 
+Go to a website (https://www.synapse.org/#!Synapse:syn2455683/wiki/64007) and download a normalized protein expression DREAM9-challenge dataset (trainingData-release.csv) (Noren et al.2016 - https://doi.org/10.1371/journal.pcbi.1004890) which is available upon registration (http://dreamchallenges.org/). These data were provided by Dr. Steven Kornblau from the University of Texas MD Anderson Cancer Center and were obtained through Synapse syn2455683 as a part of the acute myeloid leukemia (AML) DREAM-challenge. 
+
+#STEP 0: PREPARING THE DATASET AND INSTALLING THE REQUIRED R-PACKAGES
+Install the required packages and prepare the AML dataset from the downloaded CSV-file "trainingData-release.csv" (requires registration) - https://www.synapse.org/#!Synapse:syn2455683/wiki/64007.
+
+```{r}
+#DOWNLOAD REQUIRED R-PACKAGES
+library("glmnet") #https://CRAN.R-project.org/package=glmnet
+library("matrixStats") #https://CRAN.R-project.org/package=matrixStats
+library("qgraph") #https://CRAN.R-project.org/package=qgraph 
+library("netdiffuseR") #https://CRAN.R-project.org/package=netdiffuseR
+library("stringr") #https://CRAN.R-project.org/package=stringr 
+
+#Replace "~/trainingData-release.csv" with a user-specific path to the downloaded CSV-file.
+data <-read.csv("~/trainingData-release.csv", header = TRUE)
+attach(data)
+
+#Transform measured survival times ("Overall_Survival" variable) into a logarithmic scale.
+logT <- log(Overall_Survival)
+
+#Separate the expression data (renamed as "rdata") from clinical covariates and convert the censoring variable, "vital.status", to a numeric binary vector (deceased -> 1 and alive -> 0).
+rdata <- data[,c(42:272)]
+censor <- as.vector(vital.status)
+censor[censor == "D"] <- 1
+censor[censor == "A"] <- 0
+censor <- as.numeric(censor)
+
+#Segregate non-censored observations for the following two steps. These omitted samples are taken account for in the forthcoming re-evaluations steps / see the paper for detailed discussion.
+rdata <- rdata[which(censor == 1),]
+rdata <- as.matrix(rdata)
+logT <- logT[which(censor==1)]
+```
+#STEP 1: Estimate the residual vector from the main effect model (See Equation 3). 
+In this step, the main effects are estimated with the elastic-net algorithm using the "glmnet" R-package (https://CRAN.R-project.org/package=glmnet), where an optimal penalty parameter value is chosen by 5-fold cross-validation.
+```{r}
+#An argument "alpha" is the elastic net mixing parameter which gives the LASSO penalty with alpha = 1, and the ridge penalty with alpha = 0. Thus, the ridge-penalty is slightly more emphasized, meaning that the algorithm is, in comparison to the LASSO-penalty, more inclined to pick or eliminate highly correlated explanatory variables simultaneously instead of randomly picking and focusing only one of them (a known property of the LASSO algorithm).
+cv.fit <- cv.glmnet(rdata, scale(logT), alpha = 1/3, maxit = 10000)
+fit=glmnet(rdata, scale(logT), alpha = 1/3, maxit = 10000)
+
+#The resulted lambda value was 0.4536807 in our cross-validation run. 
+Coefficients <- coef(fit, s = 0.4536807)
+#*Use this line for new analyses* -> # Coefficients <- coef(fit, s = cv.fit$lambda.min)
+
+#Compute the residual vector "resid" as in Equation 3.
+v <- rdata %*% Coefficients[-1]
+resid <- scale(logT) - v
+```
+#STEP 2: Estimate the high and low networks: Differential network estimation step (See also Figure 2).
+Here we estimate the differential network between 1) the high network, which is constructed over individuals to whom the estimated residual values are above the median value of the "resid"-variable, and 2) the low network, which is estimated over individuals with "resid"-variable values smaller the  median, respectively. To estimate the corresponding network edge weights (PCCN or CCN matrix elements) by accounting for the objectives discussed in the paper, we only apply the proposed part-correlation metric (PCCN) in this analysis. 
+```{r}
+#Define how the high and low groups of individuals are divided from the residual vector using the cut-off point a. In our analysis, a = 1/2, which corresponds to the median of all estimated residual values, and thereby, divides the dataset in half. Note that all samples are used only with a = 1/2.
+a = 1/2
+#An element of the high or low network is deemed to be zero in the estimation process if its magnitude is below the value of r >= 0. Note that a non-zero value is required for identifying type II interactions.
+r = 0.1
+
+#The following loop estimates the differential part-correlation matrix (dPCCN) elements and assign their signs into an another matrix in order to compute the sign-adjusted version (signdPCCN).
+signP <- dPCCN  <- matrix(0,ncol(rdata),ncol(rdata))
+
+for(i in 1:ncol(rdata)){
+  for(j in 1:ncol(rdata)){
+    
+    res <- (lm(rdata[,j]~rdata[,i])$residuals)
+    set <- cbind(resid,res,rdata[,i])
+    high <- set[which(resid > quantile(resid, a)),]
+    low <- set[which(resid < quantile(resid,1-a)),]
+    high <- high[,-1]; low <- low[,-1]
+    
+    if(abs(cor(high[,1],high[,2])) < r){
+      H <- 0
+    }else{
+      H <- cor(high[,1],high[,2])
+    }
+    
+    if(abs(cor(low[,1],low[,2])) < r){
+      L <- 0
+    }else{
+      L <- cor(low[,1],low[,2])
+    }
+    
+    dPCCN[i,j] <- H-L
+    
+    signP[i,j] <- 0.5*abs((sign(H)-sign(L)))
+    
+     }
+}
+```
+#STEP 3: Plot and link the network connections with the underlying parametric model.
+The following lines plot two separate networks corresponding to type I and II interactions.
+```{r}
+#Assign negative values for type II interactions (+- to separate them by different colors from type I interactions in qgraph plots).
+signP[signP == 0.5] <- -1
+signdPCCN <- signP*abs(dPCCN)
+
+#The desired number of non-zero network elements (see the paper) are given by a hard-thresholding procedure.
+diag(signdPCCN) <- 0
+graph <- signdPCCN
+graph[which(graph < 0.56  & graph > -0.155)] <- 0
+for(i in 1:ncol(rdata)){
+  for(j in 1:ncol(rdata)){
+    if(graph[i,j] == 0 | graph[j,i] == 0){
+      graph[i,j] <- 0
+      graph[j,i] <- 0
+    }
+  }
+}
+
+#PLOT FIGURE 3.
+graphplus <- graphminus <- graph
+
+#Separate positive and negative network elements.
+graphplus[which(graphplus < 0)] <- 0
+graphminus[which(graphminus > 0)] <- 0
+graphplus[lower.tri(graphplus)] <- 0
+graphminus[lower.tri(graphminus)] <- 0
+
+#Create symmetric matrices.
+graphplus <- graphplus + t(graphplus)
+graphminus <-graphminus + t(graphminus)
+
+#Remove all unconnected nodes from the network.
+colnames(rdata) <- str_sub(colnames(rdata), start=1, end=8)
+iso_plus <- isolated(as.dgCMatrix(graphplus),undirected = TRUE)
+connected_plus <- colnames(rdata)[which(iso_plus == "FALSE")]
+iso_minus <- isolated(as.dgCMatrix(graphminus),undirected =TRUE)
+connected_minus <- colnames(rdata)[which(iso_minus == "FALSE")]
+
+#Remove the network "weights" by assigning the same values for all non-zero components within both networks.
+graphplus[which(graphplus != 0)] <- 1
+graphminus[which(graphminus != 0)] <- -1
+
+#Plot the resulting networks using the "qgraph" function. 
+
+par(mfrow=c(1,2))
+qgraph(graphplus[which(iso_plus == "FALSE"),which(iso_plus == "FALSE")], labels=colnames(rdata)[which(iso_plus == "FALSE")],vsize = c(5, 5), esize = 4,curve = 3, layout="spring",title = "Type I interactions",edge.color="darkgreen", label.fill.horizontal =1,label.fill.vertical=1,label.prop =0.93,title.cex = 1.45)
+qgraph(graphminus[which(iso_minus == "FALSE"),which(iso_minus == "FALSE")], labels=colnames(rdata)[which(iso_minus == "FALSE")],vsize = c(5, 5), esize = 4,curve = 3,layout="spring", title = "Type II interactions",edge.color="red",label.prop =0.93,title.cex = 1.45)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
